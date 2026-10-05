@@ -34,7 +34,7 @@ def fetch_live_market_data():
             "Bank Nifty": {"price": bank_price, "change": "+320.2 pts (+0.67%)"},
             "Sensex": {"price": sensex_price, "change": "+410.1 pts (+0.56%)"},
             "Midcap Nifty": {"price": 11250.00, "change": "+65.3 pts (+0.58%)"},
-            "FinNifty": {"price": 21300.10, "change": "+82.0 pts (+0.39%)}
+            "FinNifty": {"price": 21300.10, "change": "+82.0 pts (+0.39%)"}
         }
     except:
         return {
