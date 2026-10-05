@@ -15,7 +15,7 @@ st.markdown("""
 st.title("🚀 Shankar Trading Intelligence System (Live Feed)")
 st.markdown("---")
 
-# --- FETCH REAL-TIME MARKET DATA USING YFINANCE ---
+# --- FETCH REAL-TIME MARKET DATA (NIFTY, BANK NIFTY, SENSEX) ---
 @st.cache_data(ttl=10)
 def fetch_live_market_data():
     try:
@@ -34,7 +34,7 @@ def fetch_live_market_data():
             "Bank Nifty": {"price": bank_price, "change": "+320.2 pts (+0.67%)"},
             "Sensex": {"price": sensex_price, "change": "+410.1 pts (+0.56%)"},
             "Midcap Nifty": {"price": 11250.00, "change": "+65.3 pts (+0.58%)"},
-            "FinNifty": {"price": 21300.10, "change": "+82.0 pts (+0.39%)}
+            "FinNifty": {"price": 21300.10, "change": "+82.0 pts (+0.39%)"}
         }
     except:
         return {
@@ -49,7 +49,7 @@ live_data = fetch_live_market_data()
 
 # --- SIDEBAR: API & STATUS ---
 st.sidebar.header("🔐 Broker API Status")
-st.sidebar.success("🟢 Live Feed Active via Yahoo/NSE")
+st.sidebar.success("🟢 Live Feed Active")
 st.sidebar.markdown("---")
 tick_mode = st.sidebar.checkbox("Enable Auto-Refresh (10s)", value=True)
 
