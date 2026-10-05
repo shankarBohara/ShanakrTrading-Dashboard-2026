@@ -14,7 +14,7 @@ st.markdown("""
 st.title("🚀 Shankar Trading Intelligence System")
 st.markdown("---")
 
-# --- 1. INSTITUTIONAL ACTIVITY (FII / DII) ONLY ---
+# --- 1. INSTITUTIONAL ACTIVITY (FII / DII) ---
 st.subheader("🏦 Institutional Activity (FII/DII)")
 f1, f2, f3, f4 = st.columns(4)
 f1.metric("FII Net Flow", "₹ -1,250 Cr", "Heavy Selling 🔴")
@@ -24,7 +24,18 @@ f4.metric("India VIX", "13.20", "Low Volatility (-1.8%)")
 
 st.markdown("---")
 
-# --- 2. MAIN INDEX SELECTOR DROPDOWN (CONTROLS BLACK-SCHOLES) ---
+# --- 2. ALL LIVE SPOT INDICES (NSE & BSE) ---
+st.subheader("📊 Live Spot Parameters (All Major NSE & BSE Indices)")
+s1, s2, s3, s4, s5 = st.columns(5)
+s1.metric("Nifty 50", "24,850.00", "+75.5 pts")
+s2.metric("Bank Nifty", "51,200.50", "+180.2 pts")
+s3.metric("Sensex (BSE)", "81,400.00", "+250.1 pts")
+s4.metric("Midcap Nifty", "12,650.00", "+45.3 pts")
+s5.metric("FinNifty", "23,400.10", "+92.0 pts")
+
+st.markdown("---")
+
+# --- 3. MAIN INDEX SELECTOR DROPDOWN (CONTROLS BLACK-SCHOLES) ---
 st.subheader("🎯 Active Market Focus & Index Selector")
 selected_index = st.selectbox(
     "Choose Index for Detailed Greeks Analysis",
@@ -33,7 +44,7 @@ selected_index = st.selectbox(
 st.markdown(f"📌 **Active Target:** Black-Scholes analytics active for **`{selected_index}`**.")
 st.markdown("---")
 
-# --- 3. DYNAMIC BLACK-SCHOLES MODEL ---
+# --- 4. DYNAMIC BLACK-SCHOLES MODEL ---
 st.subheader(f"🧮 Black-Scholes Model — [{selected_index}]")
 
 if "Nifty 50" in selected_index:
@@ -57,7 +68,7 @@ b4.metric("Vega (Vega)", v_val, "Volatility Impact")
 
 st.markdown("---")
 
-# --- 4. AUTOMATED OPTION BUYING SETUPS ---
+# --- 5. AUTOMATED OPTION BUYING SETUPS ---
 st.subheader("🎯 Shankar's Automated Option Buying Setups")
 
 col_a, col_b, col_c = st.columns(3)
@@ -73,7 +84,7 @@ with col_c:
 
 st.markdown("---")
 
-# --- 5. WORLD NEWS & GAP-UP / GAP-DOWN PREDICTOR ---
+# --- 6. WORLD NEWS & GAP-UP / GAP-DOWN PREDICTOR ---
 st.subheader("📰 World Market News & Next-Day Gap-Up / Gap-Down Analysis")
 
 news_table_data = {
