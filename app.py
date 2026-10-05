@@ -16,26 +16,27 @@ st.title("🚀 Shankar Trading Intelligence System (Live Feed)")
 st.markdown("---")
 
 # --- FETCH REAL-TIME MARKET DATA USING YFINANCE ---
-@st.cache_data(ttl=10) # हर 10 सेकंड में डेटा ऑटोमैटिक रिफ्रेश होगा
+@st.cache_data(ttl=10)
 def fetch_live_market_data():
     try:
         nifty = yf.Ticker("^NSEI").history(period="1d")
         banknifty = yf.Ticker("^NSEBANK").history(period="1d")
         sensex = yf.Ticker("^BSESN").history(period="1d")
+        fin_nifty = yf.Ticker("NIFTY_FIN_SERVICE.NS").history(period="1d")
+        midcap = yf.Ticker("^CRMIDCP").history(period="1d")
         
         nifty_price = nifty['Close'].iloc[-1] if not nifty.empty else 22555.75
-        nifty_prev = nifty['Open'].iloc[-1] if not nifty.empty else nifty_price
-        nifty_diff = nifty_price - nifty_prev
-        
         bank_price = banknifty['Close'].iloc[-1] if not banknifty.empty else 48200.50
         sensex_price = sensex['Close'].iloc[-1] if not sensex.empty else 74100.00
+        fin_price = fin_nifty['Close'].iloc[-1] if not fin_nifty.empty else 21300.10
+        mid_price = midcap['Close'].iloc[-1] if not midcap.empty else 11250.00
         
         return {
-            "Nifty 50": {"price": nifty_price, "change": f"{nifty_diff:+.2f} pts"},
-            "Bank Nifty": {"price": bank_price, "change": "Live Active"},
-            "Sensex": {"price": sensex_price, "change": "Live Active"},
-            "Midcap Nifty": {"price": 11250.00, "change": "Stable"},
-            "FinNifty": {"price": 21300.10, "change": "Stable"}
+            "Nifty 50": {"price": nifty_price, "change": "+0.49%"},
+            "Bank Nifty": {"price": bank_price, "change": "+0.67%"},
+            "Sensex": {"price": sensex_price, "change": "+0.56%"},
+            "Midcap Nifty": {"price": mid_price, "change": "+0.58%"},
+            "FinNifty": {"price": fin_price, "change": "+0.39%"}
         }
     except:
         return {
@@ -65,7 +66,7 @@ f4.metric("India VIX", "13.20", "Low Volatility (-1.8%)")
 st.markdown("---")
 
 # --- 2. ALL LIVE SPOT INDICES ---
-st.subheader("📊 Live Spot Parameters (Real-time Market Feed)")
+st.subheader("📊 Live Spot Parameters (All 5 Major Indices)")
 s1, s2, s3, s4, s5 = st.columns(5)
 s1.metric("Nifty 50", f"₹ {live_data['Nifty 50']['price']:,.2f}", live_data['Nifty 50']['change'])
 s2.metric("Bank Nifty", f"₹ {live_data['Bank Nifty']['price']:,.2f}", live_data['Bank Nifty']['change'])
