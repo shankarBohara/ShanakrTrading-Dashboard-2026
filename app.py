@@ -15,7 +15,7 @@ st.markdown("""
 st.title("🚀 Shankar Trading Intelligence System (Live Feed)")
 st.markdown("---")
 
-# --- FETCH REAL-TIME MARKET DATA (NIFTY, BANK NIFTY, SENSEX) ---
+# --- FETCH REAL-TIME MARKET DATA ---
 @st.cache_data(ttl=10)
 def fetch_live_market_data():
     try:
@@ -47,7 +47,7 @@ def fetch_live_market_data():
 
 live_data = fetch_live_market_data()
 
-# --- SIDEBAR: API & STATUS ---
+# --- SIDEBAR ---
 st.sidebar.header("🔐 Broker API Status")
 st.sidebar.success("🟢 Live Feed Active")
 st.sidebar.markdown("---")
@@ -63,9 +63,10 @@ f4.metric("India VIX", "13.20", "Low Volatility (-1.8%)")
 
 st.markdown("---")
 
-# --- 2. ALL LIVE SPOT INDICES ---
+# --- 2. ALL LIVE SPOT INDICES (ALL 5 INDICES) ---
 st.subheader("📊 Live Spot Parameters (All 5 Major Indices)")
 s1, s2, s3, s4, s5 = st.columns(5)
+
 s1.metric("Nifty 50", f"₹ {live_data['Nifty 50']['price']:,.2f}", live_data['Nifty 50']['change'])
 s2.metric("Bank Nifty", f"₹ {live_data['Bank Nifty']['price']:,.2f}", live_data['Bank Nifty']['change'])
 s3.metric("Sensex (BSE)", f"₹ {live_data['Sensex']['price']:,.2f}", live_data['Sensex']['change'])
