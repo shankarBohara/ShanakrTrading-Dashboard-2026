@@ -1,196 +1,406 @@
-import streamlit as st
+import os
+import math
+import json
+import time
+import struct
+import threading
+from datetime import datetime
+
 import pandas as pd
-import numpy as np
-import requests
+import streamlit as st
+import websocket  # pip install websocket-client
 
-# Page Configuration & Professional Dark Theme
-st.set_page_config(page_title="Shankar Trading Intelligence System (Live Pro)", layout="wide", initial_sidebar_state="expanded")
+# ---------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------
+st.set_page_config(
+    page_title="Shankar Trading Intelligence System (Live Pro)",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# Custom CSS for Professional Dark Theme styling
 st.markdown("""
-    
+<style>
+    /* अपनी dark theme CSS यहाँ डालें */
+</style>
 """, unsafe_allow_html=True)
 
-# App Header
-st.title("🚀 Shankar Trading Intelligence System (Fully Dynamic Live Feed)")
-st.markdown("📌 *Connected via Dhan API & Live Multi-Segment Analytics (NSE, BSE, MCX)*")
+st.title("🚀 Shankar Trading Intelligence System (Live Tick Feed)")
+st.markdown("📌 *Dhan WebSocket Market Feed - NSE, BSE, MCX*")
 st.markdown("---")
 
-# --- SIDEBAR FOR DHAN API CREDENTIALS ---
-st.sidebar.header("🔐 Dhan API Authentication")
-client_id = st.sidebar.text_input("Dhan Client ID", value="", type="default")
-access_token = st.sidebar.text_input("Dhan Access Token", value="", type="password")
+# ---------------------------------------------------------------
+# Instruments
+# ---------------------------------------------------------------
+# Segment codes (Dhan binary header): IDX_I=0, NSE_EQ=1, NSE_FNO=2, BSE_EQ=4, MCX_COMM=5
+SEG_CODE = {"IDX_I": 0, "NSE_EQ": 1, "NSE_FNO": 2, "BSE_EQ": 4, "MCX_COMM": 5}
+
+# name: (segment, security_id, strike_step)
+INDICES = {
+    "Nifty 50":     ("IDX_I", 13, 50),
+    "Bank Nifty":   ("IDX_I", 25, 100),
+    "Sensex":       ("IDX_I", 51, 100),
+    "Midcap Nifty": ("IDX_I", 442, 25),
+    "FinNifty":     ("IDX_I", 27, 50),
+}
+VIX = ("IDX_I", 21)
+
+# MCX futures ke security id har mahine badalte hain (expiry ke saath),
+# isliye scrip master se nearest expiry auto-pick hoti hai.
+MCX_PREFIX = {
+    "Gold (MCX)":   ("GOLD", 100),
+    "Silver (MCX)": ("SILVER", 500),
+    "Crude Oil":    ("CRUDEOIL", 50),
+    "Natural Gas":  ("NATURALGAS", 2.5),
+}
+
+SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_mcx_front_month():
+    """Nearest-expiry MCX futures ke security IDs scrip master se."""
+    out = {}
+    try:
+        df = pd.read_csv(SCRIP_MASTER_URL, low_memory=False)
+        df = df[(df["SEM_EXM_EXCH_ID"] == "MCX") & (df["SEM_INSTRUMENT_NAME"] == "FUTCOM")].copy()
+        df["exp"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], errors="coerce")
+        df = df[df["exp"] >= pd.Timestamp.now().normalize()]
+        for name, (prefix, _) in MCX_PREFIX.items():
+            sub = df[df["SEM_TRADING_SYMBOL"].astype(str).str.startswith(prefix + "-")]
+            if not sub.empty:
+                row = sub.sort_values("exp").iloc[0]
+                out[name] = int(row["SEM_SMST_SECURITY_ID"])
+    except Exception as e:  # noqa
+        st.sidebar.warning(f"MCX auto-lookup fail: {e}. Neeche manual ID daalein.")
+    return out
+
+
+# ---------------------------------------------------------------
+# Binary packet parser (Dhan Market Feed v2, little endian)
+# ---------------------------------------------------------------
+def parse_packet(data: bytes):
+    if len(data) < 8:
+        return None
+    code = data[0]
+    seg = data[3]
+    secid = struct.unpack_from("<i", data, 4)[0]
+    out = {}
+    if code == 2 and len(data) >= 16:            # Ticker
+        out["ltp"] = struct.unpack_from("<f", data, 8)[0]
+        out["ltt"] = struct.unpack_from("<i", data, 12)[0]
+    elif code == 4 and len(data) >= 50:          # Quote
+        out["ltp"] = struct.unpack_from("<f", data, 8)[0]
+        out["ltt"] = struct.unpack_from("<i", data, 14)[0]
+        out["volume"] = struct.unpack_from("<i", data, 22)[0]
+        out["open"] = struct.unpack_from("<f", data, 34)[0]
+        out["close"] = struct.unpack_from("<f", data, 38)[0]
+        out["high"] = struct.unpack_from("<f", data, 42)[0]
+        out["low"] = struct.unpack_from("<f", data, 46)[0]
+    elif code == 8 and len(data) >= 62:          # Full
+        out["ltp"] = struct.unpack_from("<f", data, 8)[0]
+        out["ltt"] = struct.unpack_from("<i", data, 14)[0]
+        out["volume"] = struct.unpack_from("<i", data, 22)[0]
+        out["oi"] = struct.unpack_from("<i", data, 34)[0]
+        out["open"] = struct.unpack_from("<f", data, 46)[0]
+        out["close"] = struct.unpack_from("<f", data, 50)[0]
+        out["high"] = struct.unpack_from("<f", data, 54)[0]
+        out["low"] = struct.unpack_from("<f", data, 58)[0]
+    elif code == 6 and len(data) >= 12:          # Previous close
+        out["prev_close"] = struct.unpack_from("<f", data, 8)[0]
+    elif code == 50 and len(data) >= 10:         # Disconnect
+        out["disconnect"] = struct.unpack_from("<h", data, 8)[0]
+    else:
+        return None
+    return code, seg, secid, out
+
+
+DISCONNECT_MSG = {
+    805: "Bahut zyada connections (max 5 WebSocket)",
+    806: "Data API subscription active nahi hai",
+    807: "Access token expire ho gaya - naya token banayein",
+    808: "Authentication fail (Client ID / token galat)",
+    809: "Access token invalid",
+}
+
+
+# ---------------------------------------------------------------
+# Background WebSocket manager (ek hi connection, saare sessions share)
+# ---------------------------------------------------------------
+class FeedManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ticks = {}          # (seg_code, secid) -> dict
+        self.status = "Not started"
+        self.error = ""
+        self.last_msg = 0.0
+        self.key = None
+        self.ws = None
+
+    def ensure(self, client_id, token, instruments):
+        key = (client_id, token, tuple(instruments))
+        if self.key == key:
+            return
+        old_ws = self.ws
+        self.key = key
+        if old_ws is not None:
+            try:
+                old_ws.close()
+            except Exception:
+                pass
+        with self.lock:
+            self.ticks = {}
+        self.error = ""
+        threading.Thread(
+            target=self._run, args=(key, client_id, token, list(instruments)), daemon=True
+        ).start()
+
+    def _run(self, key, client_id, token, instruments):
+        url = (f"wss://api-feed.dhan.co?version=2&token={token}"
+               f"&clientId={client_id}&authType=2")
+
+        def on_open(ws):
+            self.status = "Connected"
+            # Indices -> Ticker (15), MCX -> Quote (17)
+            groups = {15: [], 17: []}
+            for seg, secid in instruments:
+                groups[15 if seg == "IDX_I" else 17].append(
+                    {"ExchangeSegment": seg, "SecurityId": str(secid)})
+            for req, lst in groups.items():
+                for i in range(0, len(lst), 100):
+                    chunk = lst[i:i + 100]
+                    ws.send(json.dumps({
+                        "RequestCode": req,
+                        "InstrumentCount": len(chunk),
+                        "InstrumentList": chunk,
+                    }))
+
+        def on_message(ws, msg):
+            if not isinstance(msg, (bytes, bytearray)):
+                return
+            res = parse_packet(bytes(msg))
+            if not res:
+                return
+            code, seg, secid, out = res
+            self.last_msg = time.time()
+            if "disconnect" in out:
+                self.error = DISCONNECT_MSG.get(out["disconnect"], f"Disconnect code {out['disconnect']}")
+                return
+            with self.lock:
+                self.ticks.setdefault((seg, secid), {}).update(out)
+
+        def on_error(ws, err):
+            self.error = str(err)
+
+        def on_close(ws, code, reason):
+            self.status = "Disconnected"
+
+        while self.key == key:
+            self.status = "Connecting"
+            ws = websocket.WebSocketApp(
+                url, on_open=on_open, on_message=on_message,
+                on_error=on_error, on_close=on_close)
+            self.ws = ws
+            ws.run_forever()
+            if self.key != key:
+                break
+            self.status = "Reconnecting"
+            time.sleep(5)
+
+    def snapshot(self):
+        with self.lock:
+            return {k: dict(v) for k, v in self.ticks.items()}
+
+
+@st.cache_resource
+def get_manager():
+    return FeedManager()
+
+
+# ---------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------
+st.sidebar.header("🔐 Dhan API")
+client_id = st.sidebar.text_input("Dhan Client ID", value=os.getenv("DHAN_CLIENT_ID", ""))
+access_token = st.sidebar.text_input("Dhan Access Token", value=os.getenv("DHAN_ACCESS_TOKEN", ""), type="password")
 
 st.sidebar.markdown("---")
-if st.sidebar.button("🔄 Force Refresh Live Data"):
-    st.cache_data.clear()
-    st.rerun()
+st.sidebar.subheader("MCX Security ID (optional override)")
+mcx_auto = load_mcx_front_month()
+mcx_ids = {}
+for name in MCX_PREFIX:
+    default = mcx_auto.get(name, 0)
+    val = st.sidebar.number_input(f"{name}", value=int(default), step=1, format="%d")
+    if val:
+        mcx_ids[name] = int(val)
 
-# --- FETCH LIVE MARKET DATA DIRECTLY FROM DHAN API / REAL-TIME SIMULATION ---
-@st.cache_data(ttl=5)
-def get_live_market_data(client_id, access_token):
-    # Base real-time market data dictionary
-    # If API keys are added, we parse live json; otherwise, dynamic live-simulation based on market ticks
-    market_data = {
-        "Nifty 50": {"price": 22785.50, "change": "+67.80 pts (+0.30%)", "p_change": 0.30},
-        "Bank Nifty": {"price": 55190.20, "change": "+381.5 pts (+0.70%)", "p_change": 0.70},
-        "Sensex": {"price": 73120.40, "change": "+462.8 pts (+0.63%)", "p_change": 0.63},
-        "Midcap Nifty": {"price": 12480.00, "change": "+78.2 pts (+0.63%)", "p_change": 0.63},
-        "FinNifty": {"price": 21475.50, "change": "+95.0 pts (+0.44%)", "p_change": 0.44},
-        "Gold (MCX)": {"price": 71650.00, "change": "+320.0 pts (+0.45%)", "p_change": 0.45},
-        "Silver (MCX)": {"price": 89450.00, "change": "+750.0 pts (+0.85%)", "p_change": 0.85},
-        "Crude Oil": {"price": 6220.00, "change": "-38.0 pts (-0.61%)", "p_change": -0.61},
-        "Natural Gas": {"price": 213.20, "change": "+2.5 pts (+1.18%)", "p_change": 1.18}
-    }
-    
-    if client_id and access_token:
-        try:
-            url = "https://api.dhan.co/v2/marketfeed/quote"
-            headers = {"access-token": access_token, "client-id": client_id, "Content-Type": "application/json"}
-            payload = {"NSE": [13, 25], "BSE": [1], "MCX": [423225]}
-            response = requests.post(url, json=payload, headers=headers, timeout=3)
-            if response.status_code == 200:
-                # If valid api response comes, update market_data dynamically here
-                pass
-        except:
-            pass
-            
-    return market_data
+st.sidebar.markdown("---")
+st.sidebar.subheader("Black-Scholes inputs")
+iv_input = st.sidebar.number_input("IV % (0 = India VIX use karo)", value=0.0, step=0.5)
+dte = st.sidebar.number_input("Expiry me bache din", value=5, min_value=1, step=1)
+rate = st.sidebar.number_input("Risk-free rate %", value=6.5, step=0.1)
 
-live_data = get_live_market_data(client_id, access_token)
+# ---------------------------------------------------------------
+# Start feed
+# ---------------------------------------------------------------
+manager = get_manager()
+instruments = [(INDICES[n][0], INDICES[n][1]) for n in INDICES] + [VIX]
+instruments += [("MCX_COMM", sid) for sid in mcx_ids.values()]
 
-# --- 1. INSTITUTIONAL ACTIVITY (UPDATED EOD DATA) ---
-st.subheader("🏦 Institutional Activity (FII/DII Live EOD Tracker)")
-f1, f2, f3, f4 = st.columns(4)
+if client_id and access_token:
+    manager.ensure(client_id, access_token, instruments)
+else:
+    st.warning("👈 Sidebar me Dhan Client ID aur Access Token daalein. Token 24 ghante me expire hota hai.")
+
+
+def quote_for(snap, name):
+    """(ltp, change_pts, change_pct) ya None."""
+    if name in INDICES:
+        seg, sid = INDICES[name][0], INDICES[name][1]
+    elif name in mcx_ids:
+        seg, sid = "MCX_COMM", mcx_ids[name]
+    else:
+        return None
+    t = snap.get((SEG_CODE[seg], sid))
+    if not t or "ltp" not in t:
+        return None
+    ltp = t["ltp"]
+    pc = t.get("prev_close") or t.get("close")
+    if pc:
+        chg = ltp - pc
+        return ltp, chg, chg / pc * 100
+    return ltp, None, None
+
+
+def show_metric(col, label, q):
+    if q is None:
+        col.metric(label, "—", "waiting...")
+        return
+    ltp, chg, pct = q
+    delta = f"{chg:+,.2f} pts ({pct:+.2f}%)" if chg is not None else None
+    col.metric(label, f"₹ {ltp:,.2f}", delta)
+
+
+# ---------------------------------------------------------------
+# Black-Scholes (call, ATM) - real greeks, hardcoded nahi
+# ---------------------------------------------------------------
+def bs_call_greeks(S, K, T, r, sigma):
+    sq = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / sq
+    d2 = d1 - sq
+    pdf = math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
+    N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    delta = N(d1)
+    gamma = pdf / (S * sq)
+    vega = S * pdf * math.sqrt(T) / 100            # per 1% IV
+    theta = (-(S * pdf * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * N(d2)) / 365
+    return delta, theta, gamma, vega
+
+
+# ---------------------------------------------------------------
+# Static (EOD) section - ye abhi bhi manual hai
+# ---------------------------------------------------------------
+st.subheader("🏦 Institutional Activity (EOD - manual values)")
+f1, f2, f3 = st.columns(3)
 f1.metric("FII Net Flow", "₹ -1,350 Cr", "FII Short Accumulation 🔴")
 f2.metric("DII Net Flow", "₹ +2,210 Cr", "Strong Institutional Support 🟢")
 f3.metric("PCR Ratio", "1.36", "Bullish Sentiment (>1.2)")
-f4.metric("India VIX", "13.05", "Volatility Cooling (-1.1%)")
-
 st.markdown("---")
 
-# --- 2. NSE & BSE SEGMENT ---
-st.subheader("📈 NSE & BSE Indices (Live Feed)")
-n1, n2, n3, n4, n5 = st.columns(5)
-n1.metric("Nifty 50 (NSE)", f"₹ {live_data['Nifty 50']['price']:,.2f}", live_data['Nifty 50']['change'])
-n2.metric("Bank Nifty (NSE)", f"₹ {live_data['Bank Nifty']['price']:,.2f}", live_data['Bank Nifty']['change'])
-n3.metric("Sensex (BSE)", f"₹ {live_data['Sensex']['price']:,.2f}", live_data['Sensex']['change'])
-n4.metric("Midcap Nifty (NSE)", f"₹ {live_data['Midcap Nifty']['price']:,.2f}", live_data['Midcap Nifty']['change'])
-n5.metric("FinNifty (NSE)", f"₹ {live_data['FinNifty']['price']:,.2f}", live_data['FinNifty']['change'])
-
-st.markdown("---")
-
-# --- 3. MCX COMMODITY SEGMENT ---
-st.subheader("🛢️ MCX Commodities (Evening Trading Active)")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Gold (MCX)", f"₹ {live_data['Gold (MCX)']['price']:,.2f}", live_data['Gold (MCX)']['change'])
-m2.metric("Silver (MCX)", f"₹ {live_data['Silver (MCX)']['price']:,.2f}", live_data['Silver (MCX)']['change'])
-m3.metric("Crude Oil (MCX)", f"₹ {live_data['Crude Oil']['price']:,.2f}", live_data['Crude Oil']['change'])
-m4.metric("Natural Gas (MCX)", f"₹ {live_data['Natural Gas']['price']:,.2f}", live_data['Natural Gas']['change'])
-
-st.markdown("---")
-
-# --- 4. MAIN INDEX & COMMODITY SELECTOR ---
-st.subheader("🎯 Active Market Focus & Greeks Selector")
 selected_target = st.selectbox(
-    "Choose Segment & Instrument for Black-Scholes Analysis",
-    [
-        "NSE - Nifty 50", "NSE - Bank Nifty", "BSE - Sensex", 
-        "NSE - Midcap Nifty", "NSE - FinNifty",
-        "MCX - Gold", "MCX - Silver", "MCX - Crude Oil", "MCX - Natural Gas"
-    ]
+    "Black-Scholes Analysis ke liye instrument chunein",
+    ["Nifty 50", "Bank Nifty", "Sensex", "Midcap Nifty", "FinNifty",
+     "Gold (MCX)", "Silver (MCX)", "Crude Oil", "Natural Gas"],
 )
-st.markdown(f"📌 **Active Target:** Real-time analytics running for **`{selected_target}`**.")
+
+
+# ---------------------------------------------------------------
+# LIVE PANEL - har 1 second me refresh (sirf ye hissa)
+# ---------------------------------------------------------------
+@st.fragment(run_every=1)
+def live_panel():
+    snap = manager.snapshot()
+    age = time.time() - manager.last_msg if manager.last_msg else None
+    icon = "🟢" if (age is not None and age < 5) else "🟡" if manager.status == "Connected" else "🔴"
+    status = f"{icon} Feed: **{manager.status}**"
+    if age is not None:
+        status += f" | last tick {age:.0f}s pehle | {datetime.now():%H:%M:%S}"
+    if manager.error:
+        status += f" | ⚠️ {manager.error}"
+    st.markdown(status)
+
+    # VIX
+    vix_t = snap.get((SEG_CODE[VIX[0]], VIX[1]))
+    vix_val = vix_t["ltp"] if vix_t and "ltp" in vix_t else None
+
+    st.subheader("📈 NSE & BSE Indices (Live)")
+    cols = st.columns(6)
+    show_metric(cols[0], "Nifty 50 (NSE)", quote_for(snap, "Nifty 50"))
+    show_metric(cols[1], "Bank Nifty (NSE)", quote_for(snap, "Bank Nifty"))
+    show_metric(cols[2], "Sensex (BSE)", quote_for(snap, "Sensex"))
+    show_metric(cols[3], "Midcap Nifty (NSE)", quote_for(snap, "Midcap Nifty"))
+    show_metric(cols[4], "FinNifty (NSE)", quote_for(snap, "FinNifty"))
+    cols[5].metric("India VIX", f"{vix_val:.2f}" if vix_val else "—")
+
+    st.markdown("---")
+    st.subheader("🛢️ MCX Commodities (Live)")
+    m = st.columns(4)
+    show_metric(m[0], "Gold (MCX)", quote_for(snap, "Gold (MCX)"))
+    show_metric(m[1], "Silver (MCX)", quote_for(snap, "Silver (MCX)"))
+    show_metric(m[2], "Crude Oil (MCX)", quote_for(snap, "Crude Oil"))
+    show_metric(m[3], "Natural Gas (MCX)", quote_for(snap, "Natural Gas"))
+
+    st.markdown("---")
+    st.subheader(f"🧮 Black-Scholes & Greeks - [{selected_target}]")
+    q = quote_for(snap, selected_target)
+    if q is None:
+        st.info("Spot price ka intezaar hai...")
+    else:
+        spot = q[0]
+        step = INDICES[selected_target][2] if selected_target in INDICES else MCX_PREFIX[selected_target][1]
+        atm = round(spot / step) * step
+        iv = iv_input if iv_input > 0 else (vix_val or 15.0)
+        T = dte / 365
+        d, th, g, v = bs_call_greeks(spot, atm, T, rate / 100, iv / 100)
+        st.markdown(f"🔍 **Live Spot:** `{spot:,.2f}` | **ATM Strike:** `{atm:g}` | **IV:** `{iv:.2f}%` | **DTE:** `{dte}`")
+        b = st.columns(4)
+        b[0].metric("Delta (Δ)", f"{d:.3f}", "Direction Sensitivity")
+        b[1].metric("Theta (Θ)", f"{th:.2f}", "Time Decay / Day")
+        b[2].metric("Gamma (Γ)", f"{g:.5f}", "Delta Velocity")
+        b[3].metric("Vega (ν)", f"{v:.2f}", "per 1% IV")
+
+    st.markdown("---")
+    st.subheader("🎯 Shankar's Option & Commodity Buying Setups")
+
+    def atm_of(name, step):
+        qq = quote_for(snap, name)
+        return (int(round(qq[0] / step) * step), qq[0]) if qq else (None, None)
+
+    n_atm, n_sp = atm_of("Nifty 50", 50)
+    b_atm, b_sp = atm_of("Bank Nifty", 100)
+    g_atm, g_sp = atm_of("Gold (MCX)", 100)
+    c_atm, c_sp = atm_of("Crude Oil", 50)
+
+    # NOTE: Entry/SL/Target abhi manual hain. Yahan apni strategy ka logic lagega.
+    a, b_, c_, d_ = st.columns(4)
+    a.success(f"**Nifty 50 Setup**\n\n* **Action:** BUY `{n_atm} CE`\n* **Live Spot:** {n_sp}\n* **Entry:** ₹ 145.00\n* **SL:** ₹ 118.00 🛑\n* **Target:** ₹ 190.00 / 240.00 🎯")
+    b_.info(f"**Bank Nifty Setup**\n\n* **Action:** BUY `{b_atm} CE`\n* **Live Spot:** {b_sp}\n* **Entry:** ₹ 335.00\n* **SL:** ₹ 280.00 🛑\n* **Target:** ₹ 420.00 / 500.00 🎯")
+    c_.warning(f"**Gold (MCX) Setup**\n\n* **Action:** BUY `{g_atm} CE`\n* **Live Spot:** {g_sp}\n* **Entry:** ₹ 450.00\n* **SL:** ₹ 390.00 🛑\n* **Target:** ₹ 550.00 / 650.00 🎯")
+    d_.error(f"**Crude Oil Setup**\n\n* **Action:** BUY `{c_atm} PE`\n* **Live Spot:** {c_sp}\n* **Entry:** ₹ 125.00\n* **SL:** ₹ 98.00 🛑\n* **Target:** ₹ 165.00 / 210.00 🎯")
+
+
+live_panel()
+
 st.markdown("---")
-
-# --- 5. DYNAMIC BLACK-SCHOLES MODEL ---
-st.subheader(f"🧮 Black-Scholes & Greeks — [{selected_target}]")
-
-# Extracting spot price dynamically based on selection
-if "Nifty 50" in selected_target:
-    spot = live_data["Nifty 50"]["price"]
-    strike_atm = round(spot / 50) * 50
-    delta, theta, gamma, vega = "0.54", "-31.50", "0.0022", "5.40"
-elif "Bank Nifty" in selected_target:
-    spot = live_data["Bank Nifty"]["price"]
-    strike_atm = round(spot / 100) * 100
-    delta, theta, gamma, vega = "0.52", "-76.20", "0.0016", "23.10"
-elif "Sensex" in selected_target:
-    spot = live_data["Sensex"]["price"]
-    strike_atm = round(spot / 100) * 100
-    delta, theta, gamma, vega = "0.53", "-68.90", "0.0005", "7.40"
-elif "Midcap Nifty" in selected_target:
-    spot = live_data["Midcap Nifty"]["price"]
-    strike_atm = round(spot / 25) * 25
-    delta, theta, gamma, vega = "0.55", "-21.00", "0.0055", "7.90"
-elif "FinNifty" in selected_target:
-    spot = live_data["FinNifty"]["price"]
-    strike_atm = round(spot / 50) * 50
-    delta, theta, gamma, vega = "0.52", "-31.20", "0.0039", "10.20"
-elif "Gold" in selected_target:
-    spot = live_data["Gold (MCX)"]["price"]
-    strike_atm = round(spot / 100) * 100
-    delta, theta, gamma, vega = "0.58", "-45.00", "0.0012", "15.50"
-elif "Silver" in selected_target:
-    spot = live_data["Silver (MCX)"]["price"]
-    strike_atm = round(spot / 500) * 500
-    delta, theta, gamma, vega = "0.56", "-120.50", "0.0008", "28.40"
-elif "Crude Oil" in selected_target:
-    spot = live_data["Crude Oil"]["price"]
-    strike_atm = round(spot / 50) * 50
-    delta, theta, gamma, vega = "0.51", "-18.50", "0.0045", "12.00"
-else:
-    spot = live_data["Natural Gas"]["price"]
-    strike_atm = round(spot / 2.5) * 2.5
-    delta, theta, gamma, vega = "0.53", "-2.50", "0.0210", "4.50"
-
-st.markdown(f"🔍 **Live Spot Price:** `{spot:,.2f}` | **Exact ATM Strike:** `{int(strike_atm)} ATM`")
-
-b1, b2, b3, b4 = st.columns(4)
-b1.metric("Delta (\(\Delta\))", delta, "Direction Sensitivity")
-b2.metric("Theta (\(\Theta\))", theta, "Time Decay / Day")
-b3.metric("Gamma (\(\Gamma\))", gamma, "Delta Velocity")
-b4.metric("Vega (\(\mathcal{V}\))", vega, "Volatility Impact")
-
-st.markdown("---")
-
-# --- 6. AUTOMATED OPTION BUYING SETUPS (INDICES + MCX) ---
-st.subheader("🎯 Shankar's Live Automated Option & Commodity Buying Setups")
-
-nifty_atm = int(round(live_data['Nifty 50']['price'] / 50) * 50)
-bank_atm = int(round(live_data['Bank Nifty']['price'] / 100) * 100)
-gold_atm = int(round(live_data['Gold (MCX)']['price'] / 100) * 100)
-crude_atm = int(round(live_data['Crude Oil']['price'] / 50) * 50)
-
-col_a, col_b, col_c, col_d = st.columns(4)
-
-with col_a:
-    st.success(f"**Nifty 50 Setup**\n\n* **Action:** BUY `{nifty_atm} CE`\n* **Live Spot:** {live_data['Nifty 50']['price']}\n* **Entry:** ₹ 145.00\n* **SL:** ₹ 118.00 🛑\n* **Target:** ₹ 190.00 / 240.00 🎯")
-
-with col_b:
-    st.info(f"**Bank Nifty Setup**\n\n* **Action:** BUY `{bank_atm} CE`\n* **Live Spot:** {live_data['Bank Nifty']['price']}\n* **Entry:** ₹ 335.00\n* **SL:** ₹ 280.00 🛑\n* **Target:** ₹ 420.00 / 500.00 🎯")
-
-with col_c:
-    st.warning(f"**Gold (MCX) Setup**\n\n* **Action:** BUY `{gold_atm} CE`\n* **Live Spot:** {live_data['Gold (MCX)']['price']}\n* **Entry:** ₹ 450.00\n* **SL:** ₹ 390.00 🛑\n* **Target:** ₹ 550.00 / 650.00 🎯")
-
-with col_d:
-    st.error(f"**Crude Oil Setup**\n\n* **Action:** BUY `{crude_atm} PE`\n* **Live Spot:** {live_data['Crude Oil']['price']}\n* **Entry:** ₹ 125.00\n* **SL:** ₹ 98.00 🛑\n* **Target:** ₹ 165.00 / 210.00 🎯")
-
-st.markdown("---")
-
-# --- 7. LIVE MARKET NEWS & ANALYSIS ---
-st.subheader("📰 Live Market Intelligence & Evening Session Outlook")
-
-news_table_data = {
+st.subheader("📰 Market Intelligence (manual notes)")
+df_news = pd.DataFrame({
     "Session / Time": ["Evening MCX (4:00 PM)", "Afternoon Close (3:30 PM)", "Global Cues", "Option Chain Action"],
     "Market Segment": ["Bullion & Energy", "Equity Indices", "US / European Futures", "Derivatives Data"],
-    "Live Analysis & Strategy": [
-        "🟢 **Gold & Silver:** Positive momentum holding near highs due to international safe-haven buying.",
-        "🟢 **Indices Outlook:** Strong institutional buying in DII segment pointing to steady continuation.",
-        "European markets trading with positive bias; US stock futures pointing green.",
-        "Heavy put writing observed at lower strikes across Nifty and MCX contracts supporting bulls."
-    ]
-}
-
-df_world_news = pd.DataFrame(news_table_data)
-st.table(df_world_news)
+    "Analysis": [
+        "🟢 Gold & Silver: Positive momentum holding near highs due to safe-haven buying.",
+        "🟢 Indices Outlook: Strong DII buying pointing to steady continuation.",
+        "European markets positive bias; US futures pointing green.",
+        "Heavy put writing at lower strikes across Nifty and MCX contracts supporting bulls.",
+    ],
+})
+st.table(df_news)
