@@ -4,3 +4,6 @@ numpy
 yfinance
 requests
 streamlit-autorefresh
+streamlit>=1.37
+websocket-client
+pandas
